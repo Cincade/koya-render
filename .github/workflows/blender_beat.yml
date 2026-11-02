@@ -4,6 +4,8 @@ run-name: blender beat ${{ inputs.ref }}
 # Phase 1 (31 Oct 2026): render a Blender beat from a job branch (bundle/scene.py + bundle/tex + bundle/post.py).
 # Public repo: the job branch carries only bundle.tar.gz.enc (RENDER_KEY, same openssl as farm/run.sh); every result
 # is uploaded encrypted. Content is our own licensed assets; never IA material. Logs print counts and timings only.
+# 2 Nov 2026 (Blender fast path): optional `looks` input = comma list of fastlook looks; each look x shard is one job
+# (A/B benches). Stills mode also returns the raw PNGs (r_*.png) for pixel diffs. apt only runs if Blender can't start.
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +15,7 @@ on:
       list: { description: "comma frame list (stills mode, overrides frames)", default: "" }
       samples: { description: "Cycles samples", default: "24" }
       pct: { description: "resolution percent", default: "100" }
+      looks: { description: "comma list of fastlook looks (empty = scene default)", default: "" }
 
 permissions:
   contents: read
@@ -35,7 +38,9 @@ jobs:
           else:
               a, b = "${{ inputs.frames }}".split("-"); fr = list(range(int(a), int(b) + 1))
           n = max(1, min(n, len(fr))); ch = [fr[i::n] for i in range(n)]
-          print("m=" + json.dumps([",".join(map(str, c)) for c in ch]))
+          lk = [x for x in "${{ inputs.looks }}".split(",") if x] or [""]
+          m = [{"part": ",".join(map(str, c)), "look": k, "id": (k + "_" if len(lk) > 1 else "") + str(c[0])} for k in lk for c in ch]
+          print("m=" + json.dumps(m))
           PY
   render:
     needs: plan
@@ -44,17 +49,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: ${{ fromJSON(needs.plan.outputs.m) }}
+        job: ${{ fromJSON(needs.plan.outputs.m) }}
     steps:
       - uses: actions/checkout@v4
         with: { ref: "${{ inputs.ref }}" }
       - uses: actions/cache@v4
         with: { path: ~/blender, key: "blender-${{ env.BLENDER_VER }}-linux-x64" }
-      - name: tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libgl1 libegl1 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 >/dev/null
-          python3 -c "import numpy, PIL" 2>/dev/null || pip install -q numpy pillow
       - name: unpack
         env: { RENDER_KEY: "${{ secrets.RENDER_KEY }}" }
         run: |
@@ -64,16 +64,28 @@ jobs:
             curl -sSL "https://download.blender.org/release/Blender4.5/blender-${BLENDER_VER}-linux-x64.tar.xz" -o /tmp/b.tar.xz
             mkdir -p ~/blender && tar -xf /tmp/b.tar.xz -C ~/blender --strip-components=1
           fi
+      - name: tools
+        run: |
+          if ~/blender/blender -b --factory-startup --python-expr "import bpy" >/dev/null 2>&1; then echo "apt not needed"; else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libgl1 libegl1 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 >/dev/null
+          fi
+          python3 -c "import numpy, PIL" 2>/dev/null || pip install -q numpy pillow
       - name: render
         run: |
-          ID=$(echo "${{ matrix.part }}" | cut -d, -f1)
+          ID="${{ matrix.job.id }}"; LOOK="${{ matrix.job.look }}"
           echo "ID=$ID" >> $GITHUB_ENV
+          LA=""; if [ -n "$LOOK" ]; then LA="--look $LOOK"; fi
+          OUT=$RUNNER_TEMP/out; if [ -n "$LOOK" ] && [ "$ID" != "${ID#${LOOK}_}" ]; then OUT=$RUNNER_TEMP/out/$LOOK; fi
           T0=$(date +%s)
-          ~/blender/blender -b --factory-startup -P bundle/scene.py -- --out $RUNNER_TEMP/raw --list "${{ matrix.part }}" --samples ${{ inputs.samples }} --pct ${{ inputs.pct }} 2>&1 | grep -E "^frame |^done|Error|error|Traceback|linear:" || true
-          python3 bundle/post.py $RUNNER_TEMP/raw $RUNNER_TEMP/out
-          cp $RUNNER_TEMP/raw/timing.json $RUNNER_TEMP/out/timing_$ID.json
-          echo "wall $(( $(date +%s) - T0 )) s"
-          ls $RUNNER_TEMP/out | wc -l
+          ~/blender/blender -b --factory-startup -P bundle/scene.py -- --out $RUNNER_TEMP/raw --list "${{ matrix.job.part }}" --samples ${{ inputs.samples }} --pct ${{ inputs.pct }} $LA 2>&1 | grep -E "^frame |^done|^fastlook|Error|error|Traceback|linear:" || true
+          T1=$(date +%s)
+          python3 bundle/post.py $RUNNER_TEMP/raw $OUT
+          T2=$(date +%s)
+          python3 -c "import json,sys; d=json.load(open('$RUNNER_TEMP/raw/timing.json')); d['blender_wall_s']=$T1-$T0; d['post_wall_s']=$T2-$T1; json.dump(d,open('$OUT/timing_$ID.json','w'),indent=1)"
+          if [ -n "${{ inputs.list }}" ]; then for f in $RUNNER_TEMP/raw/f_*.png; do cp "$f" "$OUT/r_$(basename $f)"; done; fi
+          echo "wall blender $((T1 - T0)) s, post $((T2 - T1)) s"
+          ls $OUT | wc -l
       - name: seal
         env: { RENDER_KEY: "${{ secrets.RENDER_KEY }}" }
         run: |
