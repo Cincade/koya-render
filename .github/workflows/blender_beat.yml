@@ -83,7 +83,7 @@ jobs:
           python3 bundle/post.py $RUNNER_TEMP/raw $OUT
           T2=$(date +%s)
           python3 -c "import json,sys; d=json.load(open('$RUNNER_TEMP/raw/timing.json')); d['blender_wall_s']=$T1-$T0; d['post_wall_s']=$T2-$T1; json.dump(d,open('$OUT/timing_$ID.json','w'),indent=1)"
-          if [ -n "${{ inputs.list }}" ]; then for f in $RUNNER_TEMP/raw/f_*.png; do cp "$f" "$OUT/r_$(basename $f)"; done; fi
+          if [ -n "${{ inputs.list }}" ]; then for f in $RUNNER_TEMP/raw/f_*.png; do if [ -e "$f" ]; then cp "$f" "$OUT/r_$(basename $f)"; fi; done; fi
           echo "wall blender $((T1 - T0)) s, post $((T2 - T1)) s"
           ls $OUT | wc -l
       - name: seal
