@@ -105,10 +105,12 @@ jobs:
         with: { pattern: "part_*", path: parts, merge-multiple: true }
       - env: { RENDER_KEY: "${{ secrets.RENDER_KEY }}" }
         run: |
+          T0=$(date +%s)
           cd parts && for f in part_*.tgz.enc; do openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:RENDER_KEY -in $f | tar -xz; rm $f; done; cd ..
           sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null)
-          ls parts/*.jpg | wc -l
-          ffmpeg -v error -y -framerate 30 -start_number 1 -i parts/f_%04d.jpg -c:v libx264 -crf 14 -preset slow -pix_fmt yuv420p -movflags +faststart beat.mp4
+          ls parts/*.jpg | wc -l; T1=$(date +%s)
+          ffmpeg -v error -y -framerate 30 -start_number 1 -i parts/f_%04d.jpg -c:v libx264 -crf 14 -preset medium -pix_fmt yuv420p -movflags +faststart beat.mp4
+          echo "join: unpack+ffmpeg install $((T1 - T0)) s, encode $(( $(date +%s) - T1 )) s"
           mkdir -p res && tar -czf /tmp/r.tgz beat.mp4 -C parts $(cd parts && ls timing_*.json)
           openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:RENDER_KEY -in /tmp/r.tgz -out res/beat.tgz.enc
       - uses: actions/upload-artifact@v4
