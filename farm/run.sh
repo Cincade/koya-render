@@ -63,5 +63,50 @@ EOF
   warm)
     [ -n "${RENDER_KEY:-}" ] || { echo "RENDER_KEY secret is not set"; exit 1; }
     python3 farm/warm_worker.py ;;
+  footage_tools)
+    # 4 Nov 2026: own-footage PiP composite. pip.py needs numpy, pillow, scipy.
+    pip install -q numpy pillow scipy
+    ffmpeg_tool ;;
+  footage_shard)
+    # Owner's own footage only (guarded by the client). Decrypt, composite this shard's frames, encrypt the pieces, delete the plaintext.
+    [ -n "${RENDER_KEY:-}" ] || { echo "RENDER_KEY secret is not set"; exit 1; }
+    W="$RUNNER_TEMP/w"; mkdir -p "$W" "$RUNNER_TEMP/out" "$RUNNER_TEMP/enc"
+    cat bundle.part_* | enc -d -out "$W/b.tar"
+    tar xf "$W/b.tar" -C "$W"; rm -f "$W/b.tar"
+    if ! python3 farm/footage_shard.py "$W/manifest.json" "$SHARD" "$SHARDS" "$RUNNER_TEMP/out" > "$RUNNER_TEMP/shard.log" 2>&1; then
+      # details only inside an encrypted file (public log): the client can fetch and decrypt it
+      tail -c 4000 "$RUNNER_TEMP/shard.log" | enc -out "$RUNNER_TEMP/enc/err_$(printf %03d "$SHARD").enc"
+      rm -rf "$W" "$RUNNER_TEMP/out" "$RUNNER_TEMP/shard.log"; echo "shard failed"; exit 1
+    fi
+    echo "sub-ranges done: $(grep -c 'done' "$RUNNER_TEMP/shard.log")"
+    tar cf - -C "$RUNNER_TEMP/out" . | enc -out "$RUNNER_TEMP/enc/chunk_$(printf %03d "$SHARD").tar.enc"
+    rm -rf "$W" "$RUNNER_TEMP/out" "$RUNNER_TEMP/shard.log" ;;
+  footage_join)
+    [ -n "${RENDER_KEY:-}" ] || { echo "RENDER_KEY secret is not set"; exit 1; }
+    P="$RUNNER_TEMP/parts"; J="$RUNNER_TEMP/j"; F="$RUNNER_TEMP/final"; mkdir -p "$J" "$F"
+    for f in "$P"/chunk_*.tar.enc; do enc -d -in "$f" | tar xf - -C "$J"; done
+    enc -d -in audio.enc -out "$J/voice.wav"
+    cd "$J"
+    SHARDS="$SHARDS" python3 -c '
+import json, glob, os
+m = sorted((json.load(open(f)) for f in glob.glob("meta_*.json")), key=lambda x: x["lo"])
+assert len(m) == int(os.environ["SHARDS"]), "shard metas missing"
+assert sum(x["hi"] - x["lo"] for x in m) == m[0]["total"]
+open("expected", "w").write(str(m[0]["total"])); open("fps", "w").write(str(m[0]["fps"]))
+open("list.txt", "w").write("".join("file %s\n" % p for x in m for p in x["pieces"]))
+print("pieces", sum(len(x["pieces"]) for x in m))
+'
+    FPS=$(cat fps)
+    ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -c copy silent.mp4
+    got=$(ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of default=nw=1:nk=1 silent.mp4)
+    exp=$(cat expected); echo "frames: got $got expected $exp"; [ "$got" = "$exp" ]
+    # final about 9 Mbps and the WhatsApp copy at 1700k (APPROVED Delivery), encoded side by side; voice as AAC
+    ffmpeg -y -loglevel error -i silent.mp4 -i voice.wav -map 0:v -map 1:a -c:v libx264 -preset medium -b:v 9M -maxrate 11M -bufsize 18M \
+      -pix_fmt yuv420p -r "$FPS" -c:a aac -b:a 192k -shortest -movflags +faststart final.mp4 & P1=$!
+    ffmpeg -y -loglevel error -i silent.mp4 -i voice.wav -map 0:v -map 1:a -c:v libx264 -preset medium -b:v 1700k -maxrate 2000k -bufsize 3400k \
+      -pix_fmt yuv420p -r "$FPS" -c:a aac -b:a 128k -shortest -movflags +faststart whatsapp.mp4 & P2=$!
+    wait $P1; wait $P2
+    enc -in final.mp4 -out "$F/final.mp4.enc"; enc -in whatsapp.mp4 -out "$F/whatsapp.mp4.enc"
+    cd /; rm -rf "$J" "$P" ;;
   *) echo "unknown step"; exit 1 ;;
 esac
