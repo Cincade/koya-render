@@ -142,18 +142,37 @@ m = sorted((json.load(open(f)) for f in glob.glob("meta_*.json")), key=lambda x:
 assert len(m) == int(os.environ["SHARDS"]), "shard metas missing"
 m = [x for x in m if x["hi"] > x["lo"]]
 assert m[0]["lo"] == 0 and all(a["hi"] == b["lo"] for a, b in zip(m, m[1:])) and m[-1]["hi"] == m[0]["total"], "blocks do not tile the video"
+# 8 Nov: check EVERY piece before the concat (an empty piece only showed up as "Stream map matches no streams")
+import subprocess, sys
+def frames_in(p):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets",
+                        "-of", "default=nw=1:nk=1", p], capture_output=True, text=True)
+    try: return int(r.stdout.strip().splitlines()[0])
+    except Exception: return -1
+bad = []
+for x in m:
+    sh, subs, got = x["shard"], x.get("subs") or [], 0
+    if not x["pieces"]: bad.append("shard %d: no pieces for frames %d-%d" % (sh, x["lo"], x["hi"]))
+    for k, p in enumerate(x["pieces"]):
+        n = frames_in(p); got += max(n, 0)
+        want = subs[k][1] - subs[k][0] if k < len(subs) else None
+        if n <= 0 or (want is not None and n != want): bad.append("shard %d %s: %d frames, expected %s" % (sh, p, n, want if want is not None else "more than 0"))
+    if got != x["hi"] - x["lo"]: bad.append("shard %d: pieces hold %d frames, block is %d" % (sh, got, x["hi"] - x["lo"]))
+if bad: print("BAD PIECES:\n  " + "\n  ".join(bad)); sys.exit(1)
+print("pieces checked:", sum(len(x["pieces"]) for x in m))
 open("expected", "w").write(str(m[0]["total"]))
 open("list.txt", "w").write("".join("file %s\n" % p for x in m for p in x["pieces"]))
 wa = [x["whatsapp"] for x in m]
 open("wa.txt", "w").write("".join("file %s\n" % p for p in wa) if all(wa) else "")
 print("pieces", sum(len(x["pieces"]) for x in m))
 '
-    ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -i audio.m4a -map 0:v -map 1:a -c copy -shortest -movflags +faststart final.mp4
+    # no -shortest: with stream copy it can drop the LAST video frame when the AAC ends a hair early (8 Nov test: 719 of 720)
+    ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -i audio.m4a -map 0:v -map 1:a -c copy -movflags +faststart final.mp4
     got=$(ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of default=nw=1:nk=1 final.mp4)
     exp=$(cat expected); echo "frames: got $got expected $exp"; [ "$got" = "$exp" ]
     enc -in final.mp4 -out "$F/final.mp4.enc"
     if [ -s wa.txt ]; then
-      ffmpeg -y -loglevel error -f concat -safe 0 -i wa.txt -i audio.m4a -map 0:v -map 1:a -c:v copy -c:a aac -b:a 96k -shortest -movflags +faststart whatsapp.mp4
+      ffmpeg -y -loglevel error -f concat -safe 0 -i wa.txt -i audio.m4a -map 0:v -map 1:a -c:v copy -c:a aac -b:a 96k -movflags +faststart whatsapp.mp4
       enc -in whatsapp.mp4 -out "$F/whatsapp.mp4.enc"
     fi
     cd /; rm -rf "$J" "$P" ;;

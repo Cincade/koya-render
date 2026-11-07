@@ -31,10 +31,11 @@ ARGS = ["--force-color-profile=srgb", "--disable-lcd-text"] + (M.get("extra_args
 
 STEP = fps // math.gcd(fps, 10000)   # 30 fps -> 3: f/fps then has an exact 4-decimal form
 al = lambda f: total if f >= total else (f // STEP) * STEP
-lo, hi = al(total * shard // shards), al(total * (shard + 1) // shards)
-subs = [(al(lo + (hi - lo) * k // pip_workers) if k else lo, al(lo + (hi - lo) * (k + 1) // pip_workers) if k < pip_workers - 1 else hi)
-        for k in range(pip_workers)]
-subs = [s for s in subs if s[1] > s[0]]
+# 8 Nov: blocks come from the client, balanced by ESTIMATED COST (board frames get dearer as elements pile up on the page:
+# 0.4 s/frame early, 6-7 s/frame late in the 5-min v3, so equal frame counts gave 40 s and 44 min shards in one run).
+blocks = M.get("blocks")
+if blocks and len(blocks) == shards: lo, hi = (int(v) for v in blocks[shard])
+else: lo, hi = al(total * shard // shards), al(total * (shard + 1) // shards)
 
 PIPD = W / pathlib.Path(M["timeline"]).parent
 sys.path.insert(0, str(PIPD))   # module level: the bundled pip.py, never the pip package (spawned workers re-import this file)
@@ -90,10 +91,30 @@ def ff(*a):
     subprocess.run(["ffmpeg", "-y", "-v", "error", *a], check=True)
 
 
+def frames_in(path):
+    """video packets in a file, or -1 when it has no readable video stream."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets",
+                        "-of", "default=nw=1:nk=1", str(path)], capture_output=True, text=True)
+    try: return int(r.stdout.strip().splitlines()[0])
+    except Exception: return -1
+
+
+def split_by_cost(lo, hi, cost, n):
+    """n contiguous sub-ranges of [lo, hi) with about equal cost, cut on exact-seek frames."""
+    tot = sum(cost[f - lo] for f in range(lo, hi)); cuts = [lo]; acc = 0.0
+    for f in range(lo, hi):
+        acc += cost[f - lo]
+        if len(cuts) < n and acc >= tot * len(cuts) / n:
+            c = al(f + 1)
+            if cuts[-1] < c < hi: cuts.append(c)
+    cuts.append(hi)
+    return [(a, b) for a, b in zip(cuts, cuts[1:]) if b > a]
+
+
 if __name__ == "__main__":
     t0 = time.time()
     out.mkdir(parents=True, exist_ok=True); frames_dir.mkdir(exist_ok=True); seq_dir.mkdir(exist_ok=True)
-    meta = dict(shard=shard, lo=lo, hi=hi, fps=fps, total=total, pieces=[f"piece_{a:07d}.mp4" for a, _ in subs], whatsapp=None)
+    meta = dict(shard=shard, lo=lo, hi=hi, fps=fps, total=total, pieces=[], subs=[], whatsapp=None)
     if hi <= lo:
         (out / f"meta_{shard:03d}.json").write_text(json.dumps(meta)); print("empty shard"); sys.exit(0)
     pip_py = PIPD / "pip.py"
@@ -109,8 +130,15 @@ if __name__ == "__main__":
         if h.hexdigest() != M["speaker_sha256"]: sys.exit("speaker cut does not match the manifest (uploaded file changed?)")
         spk.parent.mkdir(parents=True, exist_ok=True); shutil.move(str(foot), spk)
     if not spk.exists(): sys.exit("speaker cut missing")
+    # 8 Nov: a truncated upload copy (no moov atom) made pip.py write EMPTY pieces and the shard still passed. Check first.
+    s0 = round(float(tl0.get("speaker_start", 0)) * fps); have = frames_in(spk)
+    if have < s0 + hi: sys.exit(f"speaker cut is unreadable or short: {have} video frames, this block needs {s0 + hi}")
     import pip as P
     T = P.Timeline.load(str(W / M["timeline"]))
+    # pip sub-ranges by cost too: a moving frame is 12 motion-blur samples, a resting PiP frame one, a full-frame one a copy
+    pc = [10.0 if T.moving(f / fps, 0.5 / fps) else 1.0 if T.progress(f / fps)[0] > 0 else 0.05 for f in range(lo, hi)]
+    subs = split_by_cost(lo, hi, pc, pip_workers)
+    meta.update(pieces=[f"piece_{a:07d}.mp4" for a, _ in subs], subs=subs)
     bm = board_map()
     # guard: every frame pip.py composites over the board must have a board frame (else a black board under the PiP)
     need = lambda f: not (T.progress(f / fps)[0] <= 0 and not T.moving(f / fps, 0.5 / fps))
@@ -153,6 +181,9 @@ if __name__ == "__main__":
     with mp.Pool(len(subs)) as pool:
         for r in pool.imap_unordered(one, subs): print(f"sub-range of {r[1] - r[0]} frames done", flush=True)
     board.unlink()
+    bad = [(f"piece_{a:07d}.mp4", frames_in(out / f"piece_{a:07d}.mp4"), b - a) for a, b in subs]
+    bad = [x for x in bad if x[1] != x[2]]
+    if bad: sys.exit("bad pieces (name, frames, expected): " + ", ".join(map(str, bad)))
     t3 = time.time()
 
     # ---- 3. WhatsApp-size copy of the block (same encoder settings in every shard, so the join can stream-copy)
