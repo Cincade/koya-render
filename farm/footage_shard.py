@@ -12,8 +12,14 @@ man_p, shard, shards, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), pat
 W = pathlib.Path(man_p).parent
 m = json.load(open(man_p))
 total = int(m["frames"]); workers = max(1, int(m.get("workers") or 3))
-lo, hi = total * shard // shards, total * (shard + 1) // shards
-subs = [(lo + (hi - lo) * k // workers, lo + (hi - lo) * (k + 1) // workers) for k in range(workers)]
+# 7 Nov: every range starts on a frame whose time pip.py's "-ss {a/fps:.4f}" writes EXACTLY (30 fps: a multiple of 3 frames).
+# A start like 2330/30 -> "77.6667" lands past the frame, so ffmpeg's fps filter skipped it: that piece was one frame early
+# and the last piece one frame short (join: "frames: got 2396 expected 2397"). pip.py is locked, so the split is aligned here.
+import math
+STEP = int(m["fps"]) // math.gcd(int(m["fps"]), 10000)
+al = lambda f: min(total, (f // STEP) * STEP) if f < total else total
+lo, hi = al(total * shard // shards), al(total * (shard + 1) // shards)
+subs = [(al(lo + (hi - lo) * k // workers) if k else lo, al(lo + (hi - lo) * (k + 1) // workers) if k < workers - 1 else hi) for k in range(workers)]
 subs = [s for s in subs if s[1] > s[0]]
 tl_path = W / m["timeline"]
 sys.path.insert(0, str(tl_path.parent))
