@@ -108,5 +108,54 @@ print("pieces", sum(len(x["pieces"]) for x in m))
     wait $P1; wait $P2
     enc -in final.mp4 -out "$F/final.mp4.enc"; enc -in whatsapp.mp4 -out "$F/whatsapp.mp4.enc"
     cd /; rm -rf "$J" "$P" ;;
+  recap_tools)
+    # 7 Nov 2026: all-cloud recap = board page (Playwright Chromium) + pip.py (numpy, pillow, scipy) in the same job
+    pip install -q "playwright==${PLAYWRIGHT_VERSION}" numpy pillow scipy
+    python -m playwright install chromium-headless-shell >/dev/null
+    python -c "from playwright.sync_api import sync_playwright as s; p=s().start(); p.chromium.launch().close(); p.stop()" \
+      || sudo python -m playwright install-deps chromium-headless-shell >/dev/null
+    ffmpeg_tool ;;
+  recap_shard)
+    # Owner's own footage only (guarded by the client). Board frames + PiP composite of one block; everything that leaves is encrypted.
+    [ -n "${RENDER_KEY:-}" ] || { echo "RENDER_KEY secret is not set"; exit 1; }
+    W="$RUNNER_TEMP/w"; O="$RUNNER_TEMP/out"; mkdir -p "$W" "$O" "$RUNNER_TEMP/enc"
+    cat bundle.part_* | enc -d | tar xzf - -C "$W"          # board page, pip.py, timeline, face track, manifest (no video)
+    cat footage.part_* | enc -d -out "$W/footage.bin"       # the speaker cut, uploaded on its own while the plan was made
+    if ! FOOTAGE="$W/footage.bin" python3 farm/recap_shard.py "$W/manifest.json" "$SHARD" "$SHARDS" "$O" > "$RUNNER_TEMP/shard.log" 2>&1; then
+      tail -c 4000 "$RUNNER_TEMP/shard.log" | enc -out "$RUNNER_TEMP/enc/err_$(printf %03d "$SHARD").enc"
+      rm -rf "$W" "$O" "$RUNNER_TEMP/shard.log"; echo "shard failed"; exit 1
+    fi
+    echo "sub-ranges done: $(grep -c 'sub-range' "$RUNNER_TEMP/shard.log")"
+    python3 -c "import json,glob; m=json.load(open(glob.glob('$O/meta_*.json')[0])); print({k: m.get(k) for k in ('lo','hi','board_frames','board_s','board_clip_s','pip_s','wa_s')})"
+    tar cf - -C "$O" . | enc -out "$RUNNER_TEMP/enc/chunk_$(printf %03d "$SHARD").tar.enc"
+    rm -rf "$W" "$O" "$RUNNER_TEMP/shard.log" ;;
+  recap_join)
+    # stream copy only: the final is pip.py's own encode (as the approved v2 was), the voice+music mix is the Mac's AAC
+    [ -n "${RENDER_KEY:-}" ] || { echo "RENDER_KEY secret is not set"; exit 1; }
+    P="$RUNNER_TEMP/parts"; J="$RUNNER_TEMP/j"; F="$RUNNER_TEMP/final"; mkdir -p "$J" "$F"
+    for f in "$P"/chunk_*.tar.enc; do enc -d -in "$f" | tar xf - -C "$J"; done
+    enc -d -in audio.enc -out "$J/audio.m4a"
+    cd "$J"
+    SHARDS="$SHARDS" python3 -c '
+import json, glob, os
+m = sorted((json.load(open(f)) for f in glob.glob("meta_*.json")), key=lambda x: x["lo"])
+assert len(m) == int(os.environ["SHARDS"]), "shard metas missing"
+m = [x for x in m if x["hi"] > x["lo"]]
+assert m[0]["lo"] == 0 and all(a["hi"] == b["lo"] for a, b in zip(m, m[1:])) and m[-1]["hi"] == m[0]["total"], "blocks do not tile the video"
+open("expected", "w").write(str(m[0]["total"]))
+open("list.txt", "w").write("".join("file %s\n" % p for x in m for p in x["pieces"]))
+wa = [x["whatsapp"] for x in m]
+open("wa.txt", "w").write("".join("file %s\n" % p for p in wa) if all(wa) else "")
+print("pieces", sum(len(x["pieces"]) for x in m))
+'
+    ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -i audio.m4a -map 0:v -map 1:a -c copy -shortest -movflags +faststart final.mp4
+    got=$(ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of default=nw=1:nk=1 final.mp4)
+    exp=$(cat expected); echo "frames: got $got expected $exp"; [ "$got" = "$exp" ]
+    enc -in final.mp4 -out "$F/final.mp4.enc"
+    if [ -s wa.txt ]; then
+      ffmpeg -y -loglevel error -f concat -safe 0 -i wa.txt -i audio.m4a -map 0:v -map 1:a -c:v copy -c:a aac -b:a 96k -shortest -movflags +faststart whatsapp.mp4
+      enc -in whatsapp.mp4 -out "$F/whatsapp.mp4.enc"
+    fi
+    cd /; rm -rf "$J" "$P" ;;
   *) echo "unknown step"; exit 1 ;;
 esac
