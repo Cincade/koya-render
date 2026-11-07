@@ -1,0 +1,115 @@
+name: priestley
+run-name: priestley (${{ inputs.shards }} shards)
+
+# 7 Nov 2026: Priestley-style PiP mode (rounded-rect card, hard cuts, talking-head creep). Same shape as recap.yml:
+# board frames + composite per shard (farm/priestley_shard.py, shipped on the job branch), then recap_join (unchanged)
+# stream-copies the pieces and adds the Mac's mix. pip.py and recap.yml are untouched.
+# Manual trigger only: no pull_request triggers, so forks never see RENDER_KEY.
+# The job branch holds only encrypted files (footage.part_*, bundle.part_*, audio.enc); everything a runner uploads is
+# encrypted too, artifacts live 1 day and the Mac deletes them (and the branch) right after download.
+on:
+  workflow_dispatch:
+    inputs:
+      shards: { description: "number of parallel shards", default: "20" }
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  PLAYWRIGHT_VERSION: "1.60.0"   # same as the Mac, so the same Chromium build
+  FFMPEG_BUILD: "ffmpeg-n9.0-latest-linux64-gpl-9.0"
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env: { N: "${{ inputs.shards }}" }
+        run: echo "matrix=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["N"])))))')" >> "$GITHUB_OUTPUT"
+
+  shard:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false   # one slow/failed shard must not cancel the others; the client re-runs failed shards
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ env.PLAYWRIGHT_VERSION }}-${{ runner.os }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg
+          key: ${{ env.FFMPEG_BUILD }}
+      - name: tools
+        run: bash farm/run.sh recap_tools
+      - name: board + composite
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+        run: bash farm/priestley.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.shard }}
+          path: ${{ runner.temp }}/enc/chunk_*.tar.enc
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: err-${{ matrix.shard }}
+          path: ${{ runner.temp }}/enc/err_*.enc
+          retention-days: 1
+          if-no-files-found: ignore
+
+  join:
+    needs: shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg
+          key: ${{ env.FFMPEG_BUILD }}
+      - name: ffmpeg
+        run: bash farm/run.sh ffmpeg
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          path: ${{ runner.temp }}/parts
+          merge-multiple: true
+      - name: join (stream copy) + mix + WhatsApp copy
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          SHARDS: ${{ inputs.shards }}
+        run: bash farm/run.sh recap_join
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final
+          path: ${{ runner.temp }}/final/final.mp4.enc
+          retention-days: 1
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whatsapp
+          path: ${{ runner.temp }}/final/whatsapp.mp4.enc
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: ignore
+      - name: delete chunk artifacts
+        if: success()
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          for id in $(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" --jq '.artifacts[] | select(.name | startswith("chunk-")) | .id'); do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null
+          done
