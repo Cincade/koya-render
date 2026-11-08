@@ -92,7 +92,8 @@ import json, glob, os
 m = sorted((json.load(open(f)) for f in glob.glob("meta_*.json")), key=lambda x: x["lo"])
 assert len(m) == int(os.environ["SHARDS"]), "shard metas missing"
 assert sum(x["hi"] - x["lo"] for x in m) == m[0]["total"]
-open("expected", "w").write(str(m[0]["total"])); open("fps", "w").write(str(m[0]["fps"]))
+open("expected", "w").write(str(m[-1]["hi"] - m[0]["lo"] if part else m[0]["total"]))
+open("part_range", "w").write("%d %d" % (m[0]["lo"], m[-1]["hi"])); open("fps", "w").write(str(m[0]["fps"]))
 open("list.txt", "w").write("".join("file %s\n" % p for x in m for p in x["pieces"]))
 print("pieces", sum(len(x["pieces"]) for x in m))
 '
@@ -121,7 +122,9 @@ print("pieces", sum(len(x["pieces"]) for x in m))
     W="$RUNNER_TEMP/w"; O="$RUNNER_TEMP/out"; mkdir -p "$W" "$O" "$RUNNER_TEMP/enc"
     cat bundle.part_* | enc -d | tar xzf - -C "$W"          # board page, pip.py, timeline, face track, manifest (no video)
     if [ -f FOOTAGE_BRANCH ] && ! ls footage.part_* >/dev/null 2>&1; then   # 8 Nov: footage uploaded once, kept on its own branch
-      git fetch -q --depth 1 origin "$(cat FOOTAGE_BRANCH)" && git checkout -q FETCH_HEAD -- $(git ls-tree --name-only FETCH_HEAD | grep '^footage\.part_')
+      read -r FB_A FB_B < FOOTAGE_BRANCH   # "branch" (this repo) or "https://github.com/<owner>/koya-render.git branch" (the main farm, public)
+      if [ -n "${FB_B:-}" ]; then FB_SRC="$FB_A"; FB_REF="$FB_B"; else FB_SRC=origin; FB_REF="$FB_A"; fi
+      git fetch -q --depth 1 "$FB_SRC" "$FB_REF" && git checkout -q FETCH_HEAD -- $(git ls-tree --name-only FETCH_HEAD | grep '^footage\.part_')
     fi
     cat footage.part_* | enc -d -out "$W/footage.bin"       # the speaker cut, uploaded on its own while the plan was made
     if ! FOOTAGE="$W/footage.bin" python3 farm/recap_shard.py "$W/manifest.json" "$SHARD" "$SHARDS" "$O" > "$RUNNER_TEMP/shard.log" 2>&1; then
@@ -137,14 +140,16 @@ print("pieces", sum(len(x["pieces"]) for x in m))
     [ -n "${RENDER_KEY:-}" ] || { echo "RENDER_KEY secret is not set"; exit 1; }
     P="$RUNNER_TEMP/parts"; J="$RUNNER_TEMP/j"; F="$RUNNER_TEMP/final"; mkdir -p "$J" "$F"
     for f in "$P"/chunk_*.tar.enc; do enc -d -in "$f" | tar xf - -C "$J"; done
-    enc -d -in audio.enc -out "$J/audio.m4a"
+    [ "${PART:-0}" = "1" ] || enc -d -in audio.enc -out "$J/audio.m4a"
     cd "$J"
-    SHARDS="$SHARDS" python3 -c '
+    SHARDS="$SHARDS" FIRST="${FIRST:-0}" COUNT="${COUNT:-}" PART="${PART:-0}" python3 -c '
 import json, glob, os
 m = sorted((json.load(open(f)) for f in glob.glob("meta_*.json")), key=lambda x: x["lo"])
-assert len(m) == int(os.environ["SHARDS"]), "shard metas missing"
+part = os.environ.get("PART") == "1"; want_n = int(os.environ["COUNT"] or 0) if part else int(os.environ["SHARDS"])
+assert len(m) == want_n, "shard metas missing: %d of %d" % (len(m), want_n)
 m = [x for x in m if x["hi"] > x["lo"]]
-assert m[0]["lo"] == 0 and all(a["hi"] == b["lo"] for a, b in zip(m, m[1:])) and m[-1]["hi"] == m[0]["total"], "blocks do not tile the video"
+assert all(a["hi"] == b["lo"] for a, b in zip(m, m[1:])), "blocks are not contiguous"
+assert part or (m[0]["lo"] == 0 and m[-1]["hi"] == m[0]["total"]), "blocks do not tile the video"
 # 8 Nov: check EVERY piece before the concat (an empty piece only showed up as "Stream map matches no streams")
 import subprocess, sys
 def frames_in(p):
@@ -170,11 +175,15 @@ open("wa.txt", "w").write("".join("file %s\n" % p for p in wa) if all(wa) else "
 print("pieces", sum(len(x["pieces"]) for x in m))
 '
     # no -shortest: with stream copy it can drop the LAST video frame when the AAC ends a hair early (8 Nov test: 719 of 720)
-    ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -i audio.m4a -map 0:v -map 1:a -c copy -movflags +faststart final.mp4
+    if [ "${PART:-0}" = "1" ]; then   # video-only part of this farm's block; the Mac stitches the parts and adds the mix
+      ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -map 0:v -c copy -movflags +faststart final.mp4
+    else
+      ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -i audio.m4a -map 0:v -map 1:a -c copy -movflags +faststart final.mp4
+    fi
     got=$(ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of default=nw=1:nk=1 final.mp4)
     exp=$(cat expected); echo "frames: got $got expected $exp"; [ "$got" = "$exp" ]
     enc -in final.mp4 -out "$F/final.mp4.enc"
-    if [ -s wa.txt ]; then
+    if [ "${PART:-0}" != "1" ] && [ -s wa.txt ]; then
       ffmpeg -y -loglevel error -f concat -safe 0 -i wa.txt -i audio.m4a -map 0:v -map 1:a -c:v copy -c:a aac -b:a 96k -movflags +faststart whatsapp.mp4
       enc -in whatsapp.mp4 -out "$F/whatsapp.mp4.enc"
     fi

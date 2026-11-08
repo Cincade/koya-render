@@ -1,5 +1,5 @@
 name: recap
-run-name: recap (${{ inputs.shards }} shards)
+run-name: recap (${{ inputs.shards }} shards, from ${{ inputs.first }}, part ${{ inputs.part }})
 
 # 7 Nov 2026: all-cloud recap. ONE run renders the board frames AND composites the owner's own talking head (pip.py,
 # locked) shard by shard, then joins (stream copy) and adds the Mac's voice + music mix. Nothing big comes back to the
@@ -10,7 +10,10 @@ run-name: recap (${{ inputs.shards }} shards)
 on:
   workflow_dispatch:
     inputs:
-      shards: { description: "number of parallel shards", default: "20" }
+      shards: { description: "number of parallel shards (in total, across all farms)", default: "20" }
+      first: { description: "first shard this farm runs (8 Nov: one render split across accounts)", default: "0" }
+      count: { description: "how many shards this farm runs (empty = all)", default: "" }
+      part: { description: "1 = join only this farm's block into a video-only part (the Mac stitches the parts)", default: "0" }
 
 permissions:
   contents: read
@@ -27,8 +30,8 @@ jobs:
       matrix: ${{ steps.m.outputs.matrix }}
     steps:
       - id: m
-        env: { N: "${{ inputs.shards }}" }
-        run: echo "matrix=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["N"])))))')" >> "$GITHUB_OUTPUT"
+        env: { N: "${{ inputs.shards }}", F: "${{ inputs.first }}", C: "${{ inputs.count }}" }
+        run: echo "matrix=$(python3 -c 'import json, os; f = int(os.environ["F"] or 0); c = int(os.environ["C"] or int(os.environ["N"]) - f); print(json.dumps(list(range(f, f + c))))')" >> "$GITHUB_OUTPUT"
 
   shard:
     needs: plan
@@ -92,6 +95,9 @@ jobs:
         env:
           RENDER_KEY: ${{ secrets.RENDER_KEY }}
           SHARDS: ${{ inputs.shards }}
+          FIRST: ${{ inputs.first }}
+          COUNT: ${{ inputs.count }}
+          PART: ${{ inputs.part }}
         run: bash farm/run.sh recap_join
       - uses: actions/upload-artifact@v4
         with:
