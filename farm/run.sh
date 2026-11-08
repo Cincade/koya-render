@@ -120,6 +120,9 @@ print("pieces", sum(len(x["pieces"]) for x in m))
     [ -n "${RENDER_KEY:-}" ] || { echo "RENDER_KEY secret is not set"; exit 1; }
     W="$RUNNER_TEMP/w"; O="$RUNNER_TEMP/out"; mkdir -p "$W" "$O" "$RUNNER_TEMP/enc"
     cat bundle.part_* | enc -d | tar xzf - -C "$W"          # board page, pip.py, timeline, face track, manifest (no video)
+    if [ -f FOOTAGE_BRANCH ] && ! ls footage.part_* >/dev/null 2>&1; then   # 8 Nov: footage uploaded once, kept on its own branch
+      git fetch -q --depth 1 origin "$(cat FOOTAGE_BRANCH)" && git checkout -q FETCH_HEAD -- $(git ls-tree --name-only FETCH_HEAD | grep '^footage\.part_')
+    fi
     cat footage.part_* | enc -d -out "$W/footage.bin"       # the speaker cut, uploaded on its own while the plan was made
     if ! FOOTAGE="$W/footage.bin" python3 farm/recap_shard.py "$W/manifest.json" "$SHARD" "$SHARDS" "$O" > "$RUNNER_TEMP/shard.log" 2>&1; then
       tail -c 4000 "$RUNNER_TEMP/shard.log" | enc -out "$RUNNER_TEMP/enc/err_$(printf %03d "$SHARD").enc"
