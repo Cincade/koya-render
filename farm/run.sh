@@ -119,6 +119,10 @@ print("pieces", sum(len(x["pieces"]) for x in m))
     # Owner's own footage only (guarded by the client). Board frames + PiP composite of one block; everything that leaves is encrypted.
     [ -n "${RENDER_KEY:-}" ] || { echo "RENDER_KEY secret is not set"; exit 1; }
     W="$RUNNER_TEMP/w"; O="$RUNNER_TEMP/out"; mkdir -p "$W" "$O" "$RUNNER_TEMP/enc"
+    if [ -f BUNDLE_FROM ] && ! ls bundle.part_* >/dev/null 2>&1; then   # 8 Nov: the bundle is uploaded once, to the main farm's job branch
+      read -r BF_URL BF_REF < BUNDLE_FROM
+      git fetch -q --depth 1 "$BF_URL" "$BF_REF" && git checkout -q FETCH_HEAD -- $(git ls-tree --name-only FETCH_HEAD | grep '^bundle\.part_')
+    fi
     cat bundle.part_* | enc -d | tar xzf - -C "$W"          # board page, pip.py, timeline, face track, manifest (no video)
     if [ -f FOOTAGE_BRANCH ] && ! ls footage.part_* >/dev/null 2>&1; then   # 8 Nov: footage uploaded once, kept on its own branch
       read -r FB_A FB_B < FOOTAGE_BRANCH   # "branch" (this repo) or "https://github.com/<owner>/koya-render.git branch" (the main farm, public)
