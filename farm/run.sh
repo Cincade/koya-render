@@ -92,8 +92,7 @@ import json, glob, os
 m = sorted((json.load(open(f)) for f in glob.glob("meta_*.json")), key=lambda x: x["lo"])
 assert len(m) == int(os.environ["SHARDS"]), "shard metas missing"
 assert sum(x["hi"] - x["lo"] for x in m) == m[0]["total"]
-open("expected", "w").write(str(m[-1]["hi"] - m[0]["lo"] if part else m[0]["total"]))
-open("part_range", "w").write("%d %d" % (m[0]["lo"], m[-1]["hi"])); open("fps", "w").write(str(m[0]["fps"]))
+open("expected", "w").write(str(m[0]["total"])); open("fps", "w").write(str(m[0]["fps"]))
 open("list.txt", "w").write("".join("file %s\n" % p for x in m for p in x["pieces"]))
 print("pieces", sum(len(x["pieces"]) for x in m))
 '
@@ -168,7 +167,7 @@ for x in m:
     if got != x["hi"] - x["lo"]: bad.append("shard %d: pieces hold %d frames, block is %d" % (sh, got, x["hi"] - x["lo"]))
 if bad: print("BAD PIECES:\n  " + "\n  ".join(bad)); sys.exit(1)
 print("pieces checked:", sum(len(x["pieces"]) for x in m))
-open("expected", "w").write(str(m[0]["total"]))
+open("expected", "w").write(str(m[-1]["hi"] - m[0]["lo"] if part else m[0]["total"]))
 open("list.txt", "w").write("".join("file %s\n" % p for x in m for p in x["pieces"]))
 wa = [x["whatsapp"] for x in m]
 open("wa.txt", "w").write("".join("file %s\n" % p for p in wa) if all(wa) else "")
